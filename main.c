@@ -1,95 +1,200 @@
-//to compile gcc -O2 main.c -o main
-//to run ./main <input.txt >output.txt
-#include <ctype.h>
-#include <search.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
-#define MAX_UNIQUES 60000
+#define N 8
+#define M (N / 4)
+#define BUF_SIZE 4096
 
-typedef struct {
-    char* word;
-    int count;
-} count;
-
-// Comparison function for qsort() ordering by count descending.
-int cmp_count(const void* p1, const void* p2) {
-    int c1 = ((count*)p1)->count;
-    int c2 = ((count*)p2)->count;
-    if (c1 == c2) return 0;
-    if (c1 < c2) return 1;
-    return -1;
+int getReducerIndex(const char *word)
+{
+    char c = word[0] | 0x20;
+    return (c >= 'a' && c <= 'm') ? 0 : 1;
 }
 
-int main() {
-    // The hcreate hash table doesn't provide a way to iterate, so
-    // store the words in an array too (also used for sorting).
-    count* words = calloc(MAX_UNIQUES, sizeof(count));
-    int num_words = 0;
+void checkPipe(int result)
+{
+    if (result == -1)
+    {
+        perror("pipe");
+        exit(1);
+    }
+}
 
-    // Allocate hash table.
-    if (hcreate(MAX_UNIQUES) == 0) {
-        fprintf(stderr, "error creating hash table\n");
-        return 1;
+void checkWrite(ssize_t result)
+{
+    if (result == -1)
+    {
+        perror("write");
+        exit(1);
+    }
+}
+
+int main()
+{
+    int toMapper[N][2], fromMapper[N][2];
+    int toReducer[M][2], fromReducer[M][2];
+    pid_t mappers[N], reducers[M];
+
+    for (int i = 0; i < N; i++)
+    {
+        checkPipe(pipe(toMapper[i]));
+        checkPipe(pipe(fromMapper[i]));
+    }
+    for (int i = 0; i < M; i++)
+    {
+        checkPipe(pipe(toReducer[i]));
+        checkPipe(pipe(fromReducer[i]));
     }
 
-    char word[101]; // 100-char word plus NUL byte
-    while (scanf("%100s", word) != EOF) {
-        // Convert word to lower case in place.
-        for (char* p = word; *p; p++) {
-            *p = tolower(*p);
-        }
-
-        // Search for word in hash table.
-        ENTRY item = {word, NULL};
-        ENTRY* found = hsearch(item, FIND);
-        if (found != NULL) {
-            // Word already in table, increment count.
-            int* pn = (int*)found->data;
-            (*pn)++;
-        } else {
-            // Word not in table, insert it with count 1.
-            item.key = strdup(word); // need to copy word
-            if (item.key == NULL) {
-                fprintf(stderr, "out of memory in strdup\n");
-                return 1;
+    for (int i = 0; i < N; i++)
+    {
+        if ((mappers[i] = fork()) == 0)
+        {
+            dup2(toMapper[i][0], 0);
+            dup2(fromMapper[i][1], 1);
+            for (int j = 0; j < N; j++)
+            {
+                close(toMapper[j][0]);
+                close(toMapper[j][1]);
+                close(fromMapper[j][0]);
+                close(fromMapper[j][1]);
             }
-            int* pn = malloc(sizeof(int));
-            if (pn == NULL) {
-                fprintf(stderr, "out of memory in malloc\n");
-                return 1;
+            for (int j = 0; j < M; j++)
+            {
+                close(toReducer[j][0]);
+                close(toReducer[j][1]);
+                close(fromReducer[j][0]);
+                close(fromReducer[j][1]);
             }
-            *pn = 1;
-            item.data = pn;
-            ENTRY* entered = hsearch(item, ENTER);
-            if (entered == NULL) {
-                fprintf(stderr, "table full, increase MAX_UNIQUES\n");
-                return 1;
-            }
-
-            // And add to words list for iterating.
-            words[num_words].word = item.key;
-            num_words++;
+            execl("./mapper", "mapper", NULL);
+            perror("exec mapper");
+            exit(1);
         }
     }
 
-    // Iterate once to add counts to words list, then sort.
-    for (int i = 0; i < num_words; i++) {
-        ENTRY item = {words[i].word, NULL};
-        ENTRY* found = hsearch(item, FIND);
-        if (found == NULL) { // shouldn't happen
-            fprintf(stderr, "key not found: %s\n", item.key);
-            return 1;
+    for (int i = 0; i < M; i++)
+    {
+        if ((reducers[i] = fork()) == 0)
+        {
+            dup2(toReducer[i][0], 0);
+            dup2(fromReducer[i][1], 1);
+            for (int j = 0; j < N; j++)
+            {
+                close(toMapper[j][0]);
+                close(toMapper[j][1]);
+                close(fromMapper[j][0]);
+                close(fromMapper[j][1]);
+            }
+            for (int j = 0; j < M; j++)
+            {
+                close(toReducer[j][0]);
+                close(toReducer[j][1]);
+                close(fromReducer[j][0]);
+                close(fromReducer[j][1]);
+            }
+            execl("./reducer", "reducer", NULL);
+            perror("exec reducer");
+            exit(1);
         }
-        words[i].count = *(int*)found->data;
-    }
-    qsort(&words[0], num_words, sizeof(count), cmp_count); 
-
-    // Iterate again to print output.
-    for (int i = 0; i < num_words; i++) {
-        printf("%s %d\n", words[i].word, words[i].count);
     }
 
+    for (int i = 0; i < N; i++)
+        close(toMapper[i][0]);
+    for (int i = 0; i < N; i++)
+        close(fromMapper[i][1]);
+    for (int i = 0; i < M; i++)
+        close(toReducer[i][0]);
+    for (int i = 0; i < M; i++)
+        close(fromReducer[i][1]);
+
+    char *chunks[N];
+    for (int i = 0; i < N; i++)
+    {
+        chunks[i] = calloc(BUF_SIZE, 1);
+        if (!chunks[i])
+        {
+            perror("calloc");
+            exit(1);
+        }
+    }
+
+    int turn = 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), stdin))
+    {
+        strcat(chunks[turn], line);
+        turn = (turn + 1) % N;
+    }
+
+    for (int i = 0; i < N; i++)
+    {
+        checkWrite(write(toMapper[i][1], chunks[i], strlen(chunks[i])));
+        close(toMapper[i][1]);
+        free(chunks[i]);
+    }
+
+    FILE *mapperOut[N];
+    for (int i = 0; i < N; i++)
+    {
+        mapperOut[i] = fdopen(fromMapper[i][0], "r");
+        if (!mapperOut[i])
+        {
+            perror("fdopen mapperOut");
+            exit(1);
+        }
+    }
+
+    FILE *reducerIn[M];
+    for (int i = 0; i < M; i++)
+    {
+        reducerIn[i] = fdopen(toReducer[i][1], "w");
+        if (!reducerIn[i])
+        {
+            perror("fdopen reducerIn");
+            exit(1);
+        }
+    }
+
+    char word[101];
+    int count;
+    for (int i = 0; i < N; i++)
+    {
+        while (fscanf(mapperOut[i], "%100s %d", word, &count) == 2)
+        {
+            int r = getReducerIndex(word);
+            fprintf(reducerIn[r], "%s %d\n", word, count);
+        }
+        fclose(mapperOut[i]);
+    }
+
+    for (int i = 0; i < M; i++)
+        fclose(reducerIn[i]);
+
+    FILE *reducerOut[M];
+    for (int i = 0; i < M; i++)
+    {
+        reducerOut[i] = fdopen(fromReducer[i][0], "r");
+        if (!reducerOut[i])
+        {
+            perror("fdopen reducerOut");
+            exit(1);
+        }
+    }
+
+    char buf[256];
+    for (int i = 0; i < M; i++)
+    {
+        while (fgets(buf, sizeof(buf), reducerOut[i]))
+            fputs(buf, stdout);
+        fclose(reducerOut[i]);
+    }
+
+    for (int i = 0; i < N; i++)
+        waitpid(mappers[i], NULL, 0);
+    for (int i = 0; i < M; i++)
+        waitpid(reducers[i], NULL, 0);
     return 0;
 }
